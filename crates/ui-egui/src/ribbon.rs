@@ -9,12 +9,40 @@ use crate::{WordApp, icons};
 
 pub const TABS: [&str; 11] = ["File", "Home", "Insert", "Draw", "Design", "Layout", "References", "Mailings", "Review", "View", "Help"];
 
-fn in_table(app: &WordApp) -> bool {
-    app.session.sel.focus.path.cell().is_some()
+/// True when the caret/selection touches a picture (#147).
+pub fn has_picture_selected(s: &wordcraft_engine::Session) -> bool {
+    matches!(wordcraft_engine::cmd::objects::selected(s), Some((_, wordcraft_doc::para::InlineObject::Image { .. })))
+}
+
+/// Contextual tabs for the current selection (pure, tested).
+pub fn contextual_tabs(s: &wordcraft_engine::Session) -> Vec<&'static str> {
+    let mut tabs = Vec::new();
+    if s.sel.focus.path.cell().is_some() {
+        tabs.push("Table Design");
+        tabs.push("Table Layout");
+    }
+    if has_picture_selected(s) {
+        tabs.push("Picture Format");
+    }
+    tabs
+}
+
+/// Tab to show when the stored tab is no longer applicable (pure, tested).
+pub fn resolve_tab<'a>(current: &'a str, available: &[&str]) -> &'a str {
+    if available.contains(&current) { current } else { "Home" }
 }
 
 pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
+    // A contextual tab (Table, Picture Format) may be stored while the selection moved away.
+    {
+        let mut tabs: Vec<&str> = TABS.to_vec();
+        tabs.extend(contextual_tabs(&app.session));
+        let next = resolve_tab(&app.ui.tab, &tabs);
+        if next != app.ui.tab {
+            app.ui.tab = next.to_string();
+        }
+    }
     // Tab strip.
     egui::Panel::top("tabs")
         .exact_size(30.0)
@@ -23,12 +51,13 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
                 let mut tabs: Vec<&str> = TABS.to_vec();
-                if in_table(app) {
-                    tabs.push("Table Design");
-                    tabs.push("Table Layout");
+                for ct in contextual_tabs(&app.session) {
+                    if !tabs.contains(&ct) {
+                        tabs.push(ct);
+                    }
                 }
                 for tab in tabs {
-                    let contextual = tab.starts_with("Table ");
+                    let contextual = tab.starts_with("Table ") || tab == "Picture Format";
                     let shown = tl!(tab);
                     let w = ui.ctx().fonts_mut(|f| f.layout_no_wrap(shown.to_string(), medium(12.5), t.text).size().x) + 18.0;
                     let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
@@ -113,6 +142,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                         "Help" => help(app, ui),
                         "Table Design" => table_design(app, ui),
                         "Table Layout" => table_layout(app, ui),
+                        "Picture Format" => picture_format(app, ui),
                         _ => home(app, ui),
                     }
                 });
@@ -130,7 +160,9 @@ fn stack(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 fn mi(ui: &mut Ui, app: &mut WordApp, label: &str, id: &str, params: Value) {
     let sc = crate::widgets::shortcut_text(app, id);
     let enabled = crate::widgets::enabled(app, id);
-    let resp = ui.add_enabled(enabled, egui::Button::new(tl!(label)).shortcut_text(sc).min_size(vec2(200.0, 0.0)));
+    let location = app.session.registry.get(id).map(|s| s.location).unwrap_or("");
+    let label = crate::i18n::t_at(location, label);
+    let resp = ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(sc).min_size(vec2(200.0, 0.0)));
     if resp.clicked() {
         let _ = app.run(id, params);
         ui.close();
@@ -289,7 +321,8 @@ fn home(app: &mut WordApp, ui: &mut Ui) {
                     mi(ui, app, "I. A. 1. a.", "para.multilevel", json!({"kind": "outline"}));
                     ui.separator();
                     for lv in 0..5u64 {
-                        mi(ui, app, &format!("Change to Level {}", lv + 1), "para.listLevel", json!({"level": lv}));
+                        let level = (lv + 1).to_string();
+                        mi(ui, app, &crate::i18n::fmt(tl!("Change to Level {level}"), &[("level", &level)]), "para.listLevel", json!({"level": lv}));
                     }
                 });
                 ui.add_space(4.0);
@@ -591,7 +624,9 @@ fn layout(app: &mut WordApp, ui: &mut Ui) {
         });
         menu_button(ui, app, "size", Some("Size"), "Size", true, |ui, app| {
             for (n, w, h) in wordcraft_geom::PAPER_SIZES {
-                mi(ui, app, &format!("{n}   {:.2}\" × {:.2}\"", w / 72.0, h / 72.0), "layout.size", json!({"name": n}));
+                let u = crate::i18n::length_unit();
+                let size = |pt: f32| if u.decimal_comma { u.number(f64::from(pt / u.points), 1) } else { format!("{:.2}", pt / u.points) };
+                mi(ui, app, &format!("{n}   {}{} × {}{}", size(*w), u.suffix, size(*h), u.suffix), "layout.size", json!({"name": n}));
             }
         });
         menu_button(ui, app, "columns", Some("Columns"), "Columns", true, |ui, app| {
@@ -630,17 +665,20 @@ fn layout(app: &mut WordApp, ui: &mut Ui) {
     group(ui, "Paragraph", Some("para.dialog"), app, |ui, app| {
         let rp = app.session.doc.para_at(&app.session.sel.focus).map(|p| app.session.doc.styles.resolve_para(&p.props));
         let Some(rp) = rp else { return };
-        egui::Grid::new("layout_para").spacing(vec2(6.0, 4.0)).show(ui, |ui| {
+        // Two rows of fields under their headings fit the ribbon's content height.
+        egui::Grid::new("layout_para").spacing(vec2(6.0, 1.0)).show(ui, |ui| {
             ui.label(egui::RichText::new(tl!("Indent")).small().strong());
             ui.label("");
             ui.label(egui::RichText::new(tl!("Spacing")).small().strong());
             ui.end_row();
-            let mut l = rp.indent_left / 72.0;
+            let unit = crate::i18n::length_unit().points;
+            let indent_range = -792.0 / unit..=1584.0 / unit;
+            let mut l = rp.indent_left / unit;
             let mut b = rp.space_before;
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tl!("Left:")).small());
-                if ui.add(egui::DragValue::new(&mut l).speed(0.05).range(-11.0..=22.0).suffix("\"").max_decimals(2)).changed() {
-                    let _ = app.run("para.indents", json!({"left": l * 72.0}));
+                if ui.add(crate::widgets::length_value(&mut l).range(indent_range.clone())).changed() {
+                    let _ = app.run("para.indents", json!({"left": l * unit}));
                 }
             });
             ui.label("");
@@ -651,12 +689,12 @@ fn layout(app: &mut WordApp, ui: &mut Ui) {
                 }
             });
             ui.end_row();
-            let mut r = rp.indent_right / 72.0;
+            let mut r = rp.indent_right / unit;
             let mut a = rp.space_after;
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tl!("Right:")).small());
-                if ui.add(egui::DragValue::new(&mut r).speed(0.05).range(-11.0..=22.0).suffix("\"").max_decimals(2)).changed() {
-                    let _ = app.run("para.indents", json!({"right": r * 72.0}));
+                if ui.add(crate::widgets::length_value(&mut r).range(indent_range)).changed() {
+                    let _ = app.run("para.indents", json!({"right": r * unit}));
                 }
             });
             ui.label("");
@@ -696,7 +734,7 @@ fn references(app: &mut WordApp, ui: &mut Ui) {
             menu_button(ui, app, "addText", Some("Add Text"), "Add Text", false, |ui, app| {
                 mi(ui, app, "Do Not Show in TOC", "references.addText", json!({"level": 0}));
                 for l in 1..=3u64 {
-                    mi(ui, app, &format!("Level {l}"), "references.addText", json!({"level": l}));
+                    mi(ui, app, &crate::i18n::fmt(tl!("Level {level}"), &[("level", &l.to_string())]), "references.addText", json!({"level": l}));
                 }
             });
             small(ui, app, "updateTable", Some("Update Table"), "Update Table", "references.updateToc", json!({}), false);
@@ -925,6 +963,133 @@ fn help(app: &mut WordApp, ui: &mut Ui) {
     });
 }
 
+fn picture_format(app: &mut WordApp, ui: &mut Ui) {
+    group(ui, "Adjust", None, app, |ui, app| {
+        menu_button(ui, app, "picture", Some("Corrections"), "Brightness, contrast and sharpness", true, |ui, app| {
+            for (l, b, c) in
+                [("Brighter +20%", 20.0, 0.0), ("Darker −20%", -20.0, 0.0), ("More Contrast +20%", 0.0, 20.0), ("Less Contrast −20%", 0.0, -20.0)]
+            {
+                mi(ui, app, l, "picture.corrections", json!({"brightness": b, "contrast": c}));
+            }
+            ui.separator();
+            mi(ui, app, "Sharpen", "picture.corrections", json!({"sharpen": 40.0}));
+            mi(ui, app, "Soften", "picture.corrections", json!({"sharpen": -40.0}));
+        });
+        menu_button(ui, app, "picture", Some("Color"), "Saturation and recolor", true, |ui, app| {
+            for (l, v) in [("Full Saturation 100%", 100.0), ("Muted 50%", 50.0), ("Gray 0%", 0.0), ("Vivid 200%", 200.0)] {
+                mi(ui, app, l, "picture.color", json!({"mode": "saturation", "saturation": v}));
+            }
+            ui.separator();
+            mi(ui, app, "Grayscale", "picture.color", json!({"mode": "grayscale"}));
+            mi(ui, app, "Sepia", "picture.color", json!({"mode": "sepia"}));
+            mi(ui, app, "Washout", "picture.color", json!({"mode": "washout"}));
+        });
+        menu_button(ui, app, "picture", Some("Transparency"), "Picture transparency", true, |ui, app| {
+            for v in [0.0, 15.0, 30.0, 50.0, 65.0, 80.0, 95.0] {
+                mi(ui, app, &format!("{v:.0}%"), "picture.transparency", json!({"percent": v}));
+            }
+        });
+        stack(ui, |ui| {
+            small(ui, app, "picture", Some("Change"), "Change Picture", "ui.changePicture", json!({}), false);
+            small(ui, app, "picture", Some("Reset"), "Reset Picture", "picture.reset", json!({}), false);
+        });
+    });
+    group(ui, "Picture Styles", None, app, |ui, app| {
+        menu_button(ui, app, "picture", Some("Styles"), "Frames and effects", true, |ui, app| {
+            for (l, s) in [
+                ("Simple Frame", "simpleFrame"),
+                ("Thick Frame", "thickFrame"),
+                ("Rounded", "rounded"),
+                ("Soft Edge", "softEdge"),
+                ("Shadow", "shadow"),
+            ] {
+                mi(ui, app, l, "picture.style", json!({"style": s}));
+            }
+        });
+        menu_button(ui, app, "picture", Some("Border"), "Picture border", true, |ui, app| {
+            for (l, w) in [("Thin", 2), ("Medium", 4), ("Thick", 8)] {
+                mi(ui, app, l, "picture.border", json!({"width": w}));
+            }
+        });
+    });
+    group(ui, "Arrange", None, app, |ui, app| {
+        big(ui, app, "position", "Position", "arrange.position", json!({}), false);
+        big(ui, app, "wrapText", "Wrap\nText", "arrange.wrap", json!({}), false);
+        stack(ui, |ui| {
+            small(ui, app, "rotate", Some("Rotate"), "Rotate", "arrange.rotate", json!({}), false);
+            small(ui, app, "align", Some("Align"), "Align", "arrange.align", json!({}), false);
+        });
+    });
+    group(ui, "Size", None, app, |ui, app| {
+        let (media, off, w0, h0, crop0, alt0) = match wordcraft_engine::cmd::objects::selected(&app.session) {
+            Some((pos, wordcraft_doc::para::InlineObject::Image { media, w, h, alt, crop, .. })) => (media, pos.off, w, h, crop, alt),
+            _ => (String::new(), 0, 0.0, 0.0, [0.0; 4], String::new()),
+        };
+        // `picture.size` locks the aspect ratio unless told otherwise, so one dimension suffices.
+        stack(ui, |ui| {
+            crate::widgets::row(ui, |ui| {
+                ui.label(egui::RichText::new(tl!("W:")).small());
+                let mut w = w0;
+                let r = ui.add(egui::DragValue::new(&mut w).speed(1.0).range(4.0..=2000.0).suffix(" pt"));
+                if r.changed() {
+                    if r.dragged() && !r.drag_started() {
+                        app.session.join_next_undo();
+                    }
+                    let _ = app.run("picture.size", json!({"width": w}));
+                }
+                ui.label(egui::RichText::new(tl!("H:")).small());
+                let mut h = h0;
+                let r = ui.add(egui::DragValue::new(&mut h).speed(1.0).range(4.0..=2000.0).suffix(" pt"));
+                if r.changed() {
+                    if r.dragged() && !r.drag_started() {
+                        app.session.join_next_undo();
+                    }
+                    let _ = app.run("picture.size", json!({"height": h}));
+                }
+            });
+            ui.add_space(2.0);
+            crate::widgets::row(ui, |ui| {
+                for (i, side) in ["L", "T", "R", "B"].iter().enumerate() {
+                    ui.label(egui::RichText::new(tl!(side)).small());
+                    let mut v = crop0[i] * 100.0;
+                    let r = ui.add(egui::DragValue::new(&mut v).speed(0.5).range(0.0..=45.0).suffix("%"));
+                    if r.changed() {
+                        if r.dragged() && !r.drag_started() {
+                            app.session.join_next_undo();
+                        }
+                        let mut c = crop0;
+                        c[i] = (v / 100.0).clamp(0.0, 0.45);
+                        let _ = app.run("picture.crop", json!({"left": c[0], "top": c[1], "right": c[2], "bottom": c[3]}));
+                    }
+                }
+                if ui.button(egui::RichText::new(tl!("Reset")).small()).on_hover_text(tl!("Reset Crop")).clicked() {
+                    let _ = app.run("picture.crop", json!({"left": 0.0, "top": 0.0, "right": 0.0, "bottom": 0.0}));
+                }
+            });
+            ui.add_space(2.0);
+            crate::widgets::row(ui, |ui| {
+                ui.label(egui::RichText::new(tl!("Alt:")).small());
+                // Frame-local buffers lose keystrokes; keep the draft in egui temp memory keyed
+                // by picture (same pattern as the comment editor in panes.rs).
+                let key = egui::Id::new(("picture_alt", media.clone(), off));
+                let mut alt = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| alt0.clone());
+                let r = ui.add(egui::TextEdit::singleline(&mut alt).desired_width(120.0).hint_text(tl!("Alt text")));
+                if r.changed() {
+                    ui.data_mut(|d| d.insert_temp(key, alt.clone()));
+                }
+                if r.lost_focus() {
+                    ui.data_mut(|d| d.remove::<String>(key));
+                    // The click that took focus may have selected another picture; never commit
+                    // one picture's draft onto another.
+                    if alt != alt0 && app.selected_picture_media().as_deref() == Some(media.as_str()) {
+                        let _ = app.run("picture.altText", json!({"text": alt}));
+                    }
+                }
+            });
+        });
+    });
+}
+
 fn table_design(app: &mut WordApp, ui: &mut Ui) {
     let look = app.session.sel.focus.path.cell().and_then(|(tp, _, _)| app.session.doc.table(app.session.sel.focus.story, &tp).map(|t| t.props.look));
     group(ui, "Table Style Options", None, app, |ui, app| {
@@ -1063,4 +1228,41 @@ fn table_layout(app: &mut WordApp, ui: &mut Ui) {
             small(ui, app, "formula", Some("Formula"), "Formula", "table.formula", json!({}), false);
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wordcraft_engine::Session;
+
+    fn png_data() -> String {
+        let img = image::RgbaImage::from_fn(20, 10, |x, y| {
+            if x > 2 && x < 17 && y > 2 && y < 7 { image::Rgba([200, 30, 30, 255]) } else { image::Rgba([255, 255, 255, 255]) }
+        });
+        let mut b = Vec::new();
+        image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut b), image::ImageFormat::Png).unwrap();
+        wordcraft_engine::cmd::insert::base64_encode(&b)
+    }
+
+    #[test]
+    fn picture_format_tab_appears_when_picture_selected() {
+        let mut s = Session::new(wordcraft_doc::Document::new());
+        assert!(!has_picture_selected(&s));
+        assert!(!contextual_tabs(&s).contains(&"Picture Format"));
+        s.run("insert.picture", &json!({"data": png_data()})).unwrap();
+        assert!(has_picture_selected(&s));
+        assert!(contextual_tabs(&s).contains(&"Picture Format"));
+        s.run("select.collapse", &json!({"end": true})).unwrap();
+        s.run("text.insert", &json!({"text": "x"})).unwrap();
+        assert!(!has_picture_selected(&s));
+    }
+
+    #[test]
+    fn resolve_tab_falls_back_when_contextual_tab_expires() {
+        let all = ["Home", "Table Design", "Picture Format"];
+        assert_eq!(resolve_tab("Picture Format", &all), "Picture Format");
+        assert_eq!(resolve_tab("Picture Format", &["Home"]), "Home");
+        assert_eq!(resolve_tab("Table Design", &["Home"]), "Home");
+        assert_eq!(resolve_tab("Home", &["Home"]), "Home");
+    }
 }

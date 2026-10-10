@@ -165,8 +165,8 @@ pub fn update_toc(s: &mut Session) -> Result<(), CmdError> {
     let leads: Vec<usize> =
         entries.iter().map(|(path, ..)| s.doc.para(StoryRef::Body, path).map_or(0, |p| p.text.bytes().take_while(|b| *b == 0x0C).count())).collect();
     for pass in 0..2 {
-        // Pass 1 lays out with the entries in place, so headings sit `entries.len()` blocks
-        // further down and their pages account for the TOC's own length.
+        // Pass 1 lays out with the entries in place, so headings below the TOC sit `entries.len()`
+        // blocks further down and their pages account for the TOC's own length.
         s.touch();
         let l = s.layout();
         if pass == 1 {
@@ -177,7 +177,7 @@ pub fn update_toc(s: &mut Session) -> Result<(), CmdError> {
         }
         let shift = if pass == 0 { 0 } else { entries.len() };
         for (k, (path, level, text)) in entries.iter().enumerate() {
-            let target = Path::top(path.last() + shift);
+            let target = Path::top(path.last() + if path.last() > start { shift } else { 0 });
             let off = leads.get(k).copied().unwrap_or(0);
             let page = l.caret(&Pos { story: StoryRef::Body, path: target, off }).and_then(|c| l.pages.get(c.page)).map(|pg| pg.number).unwrap_or(1);
             let mut para = Paragraph::with_text(&format!("{text}\t{page}"), CharProps::default()).styled(&format!("TOC{}", level + 1));
@@ -268,6 +268,9 @@ fn caption(s: &mut Session, v: &Value) -> CmdResult {
 /// Update fields in the body: dates, SEQ numbering, TOC.
 pub fn update_fields(s: &mut Session) -> Result<(), CmdError> {
     let mut seq: std::collections::HashMap<String, u32> = Default::default();
+    // Dates are written in the document's language (German Word writes `10.10.2026` and
+    // `Oktober`); a document without one follows the session.
+    let lang = crate::sample::Lang::from_tag(s.doc.styles.default_chr.lang.as_deref().unwrap_or(&s.template_language));
     for path in s.doc.para_paths(StoryRef::Body) {
         let Some(p) = s.doc.para(StoryRef::Body, &path) else { continue };
         if !p.objects.iter().any(|o| matches!(o, InlineObject::Field { .. })) {
@@ -279,12 +282,13 @@ pub fn update_fields(s: &mut Session) -> Result<(), CmdError> {
             let name = wordcraft_layout::fields::field_name(instr);
             match name.as_str() {
                 "DATE" | "TIME" | "CREATEDATE" | "SAVEDATE" | "PRINTDATE" => {
-                    let pic = instr
-                        .split("\\@")
-                        .nth(1)
-                        .map(|x| x.trim().trim_matches('"').to_string())
-                        .unwrap_or_else(|| if name == "TIME" { "h:mm am/pm".into() } else { "M/d/yyyy".into() });
-                    updates.push((k, super::insert::format_date(&pic)));
+                    let pic =
+                        instr.split("\\@").nth(1).map(|x| x.trim().trim_matches('"').to_string()).unwrap_or_else(|| match (name.as_str(), lang) {
+                            ("TIME", crate::sample::Lang::German) => "HH:mm".into(),
+                            ("TIME", _) => "h:mm am/pm".into(),
+                            _ => super::insert::default_date_picture(lang).into(),
+                        });
+                    updates.push((k, super::insert::format_date_in(&pic, lang)));
                 }
                 "SEQ" => {
                     let id = instr.split_whitespace().nth(1).unwrap_or("").to_string();
